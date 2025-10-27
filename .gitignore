@@ -1,0 +1,19 @@
+# 忽略所有 .log 文件
+drr_pose_dataset_with_landmarks.h5
+dummy_lpm_dataset.h5
+data/ipcai_2020_full_res_data/ipcai_2020_full_res_data.h5
+data/ljubljana/ljubljana.h5
+*.h5
+# 忽略 node_modules 整个目录
+# 注意末尾的斜杠，表示这是一个目录
+logs/
+help_function/
+checkpoints/
+data/ipcai_2020_full_res_data/
+data/ljubljana/
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+
