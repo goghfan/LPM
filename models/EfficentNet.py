@@ -1,27 +1,10 @@
-# -*- coding: utf-8 -*-
-
-"""
-本文件定义了LPM框架的核心模型组件。
-
-1. SceneEncoderHashGrid:
-   - 架构A：基于场景的隐式表示。
-   - 输入3D坐标，输出该点的(密度, 特征)。
-
-2. ImageEncoder:
-   - 2D图像编码器 E_ϕ。
-   - 基于预训练的EfficientNet，用于从2D图像中提取高维特征图。
-"""
+# models/EfficentNet.py (或 models/models.py)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-
-# 尝试导入 tinycudann
-try:
-    import tinycudann as tcnn
-except ImportError:
-    tcnn = None # 允许在没有tcnn的环境下，仍能使用下面的ImageEncoder
+import tinycudann as tcnn # 假设 tcnn 已导入
 
 # ##############################################################################
 # 1. 3D场景编码器 (SceneEncoderHashGrid)
@@ -30,11 +13,12 @@ except ImportError:
 class SceneEncoderHashGrid(nn.Module):
     """
     一个3D场景编码器，将3D坐标映射到解耦的(密度, 特征)对。
+    [已修正] 包含了 float() 转换以修复 Half/Float 错误。
     """
     def __init__(
         self,
         bounding_box: tuple = (-1.0, 1.0),
-        feature_dim: int = 32,
+        feature_dim: int = 32, # [!!! 注意 !!!] train.py 中会传入 1536
         hashgrid_log2_hashmap_size: int = 19,
         hashgrid_n_levels: int = 16,
         hashgrid_n_features_per_level: int = 2,
@@ -69,6 +53,7 @@ class SceneEncoderHashGrid(nn.Module):
         )
 
         self.density_head = nn.Linear(decoder_n_neurons, 1)
+        # [!!! 注意 !!!] 输出维度将由传入的 feature_dim (1536) 决定
         self.feature_head = nn.Linear(decoder_n_neurons, feature_dim)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -76,14 +61,12 @@ class SceneEncoderHashGrid(nn.Module):
         grid_features = self.grid_encoder(normalized_x)
         hidden_features = self.decoder_mlp(grid_features)
         
-        # --- 错误修正 ---
-        # 将tiny-cuda-nn输出的半精度(float16)张量，转换为全精度(float32)
-        # 以匹配后续 nn.Linear 层的期望数据类型。
+        # --- 修正 Half/Float 错误 ---
         hidden_features_float = hidden_features.float()
+        # ---------------------------
         
         density_output = self.density_head(hidden_features_float)
         f = self.feature_head(hidden_features_float)
-        # -----------------
         
         rho = F.softplus(density_output)
         
@@ -96,9 +79,10 @@ class SceneEncoderHashGrid(nn.Module):
 class ImageEncoder(nn.Module):
     """
     一个2D图像编码器 E_ϕ，用于从2D图像中提取高维特征图。
-    本实现基于在ImageNet上预训练的EfficientNet-B3。
+    [已修改] 移除了 channel_mapper，直接输出 EfficientNet 的特征。
     """
-    def __init__(self, pretrained: bool = True, output_dim: int = 32):
+    # [!!! 修改 1 !!!] 移除 output_dim 参数
+    def __init__(self, pretrained: bool = True): 
         super().__init__()
         
         if pretrained:
@@ -107,6 +91,7 @@ class ImageEncoder(nn.Module):
         else:
             efficientnet = models.efficientnet_b3(weights=None)
             
+        # 使用 EfficientNet 的特征提取器部分
         self.feature_extractor = efficientnet.features
         
         # 适配器 (将 1 通道灰度图变为 3 通道)
@@ -114,15 +99,10 @@ class ImageEncoder(nn.Module):
         self.input_adapter.weight.data = torch.tensor([[[[1.0]]], [[[1.0]]], [[[1.0]]]])
         self.input_adapter.weight.requires_grad = False
 
-        # --- [!!! 关键修改 2 !!!] ---
-        # 添加一个 1x1 卷积层，将主干的输出通道 (例如 1536) 映射到
-        # 我们需要的输出维度 (例如 32)，以匹配 Projector。
-        
-        # 自动获取 EfficientNet-B3 主干的输出通道数 (即 1536)
-        in_channels = efficientnet.classifier[1].in_features
-        
-        self.channel_mapper = nn.Conv2d(in_channels, output_dim, kernel_size=1)
+        # --- [!!! 修改 2 !!!] ---
+        # 移除 self.channel_mapper
         # --- [修改结束] ---
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (B, 1, 256, 256) -> (B, 3, 256, 256)
         x_3channel = self.input_adapter(x)
@@ -130,46 +110,9 @@ class ImageEncoder(nn.Module):
         # (B, 3, 256, 256) -> (B, 1536, 8, 8)
         feature_map = self.feature_extractor(x_3channel)
         
-        # --- [!!! 关键修改 3 !!!] ---
-        # (B, 1536, 8, 8) -> (B, 32, 8, 8)
-        mapped_feature_map = self.channel_mapper(feature_map)
+        # --- [!!! 修改 3 !!!] ---
+        # 直接返回主干网络的输出
+        return feature_map
         # --- [修改结束] ---
-        
-        return mapped_feature_map
 
-# --- 模型测试入口 ---
-if __name__ == '__main__':
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"--- 模型测试 ---")
-    print(f"使用设备: {device}")
-    
-    # --- 测试 2D ImageEncoder ---
-    print("\n--- 2D ImageEncoder (EfficientNet-B3) 测试 ---")
-    
-    image_encoder = ImageEncoder(pretrained=True).to(device)
-    image_encoder.eval() 
-
-    batch_size = 4
-    image_height = 256
-    image_width = 256
-    dummy_input_image = torch.randn(batch_size, 1, image_height, image_width).to(device)
-
-    print(f"输入图像形状: {dummy_input_image.shape}")
-
-    with torch.no_grad():
-        output_feature_map = image_encoder(dummy_input_image)
-
-    print(f"输出特征图形状: {output_feature_map.shape}")
-    print("ImageEncoder 测试成功！")
-    
-    # --- 测试 3D SceneEncoderHashGrid (如果可用) ---
-    print("\n--- 3D SceneEncoderHashGrid 测试 ---")
-    if torch.cuda.is_available() and tcnn is not None:
-        model_A = SceneEncoderHashGrid(feature_dim=32).to(device)
-        input_A = torch.rand(1024, 3, device=device) * 2 - 1
-        rho, f = model_A(input_A)
-        print(f"输入形状 (3D坐标): {input_A.shape}")
-        print(f"输出形状 (密度, 特征): {rho.shape}, {f.shape}")
-        print("SceneEncoderHashGrid 测试成功！")
-    else:
-        print("跳过测试：需要CUDA和tiny-cuda-nn。")
+# ... (测试代码部分可以保留或移除) ...

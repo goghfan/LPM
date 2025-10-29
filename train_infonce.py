@@ -3,14 +3,14 @@
 """
 本文件是LPM框架的核心训练脚本。
 [已更新]
-1. feature_dim 恢复为 1536，ImageEncoder 不再映射通道。
-2. 学习率降低。
-3. TripletLoss 中加入 L2 特征归一化。
+1. 使用 InfoNCE Loss 替代 Triplet Margin Loss。
+2. 在计算相似度前进行 L2 特征归一化。
+3. 添加了 temperature 超参数。
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F # [新增] 为了 L2 归一化
+import torch.nn.functional as F # 用于 L2 归一化和余弦相似度
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -28,7 +28,7 @@ from torchvision.utils import make_grid
 # --- 项目内部模块导入 ---
 from data.dataloader import LPMDataset
 # [注意] 确保从包含 float() 修复的文件导入
-from models.EfficentNet import SceneEncoderHashGrid, ImageEncoder 
+from models.EfficentNet import SceneEncoderHashGrid, ImageEncoder
 from models.scene_encoder_mlp import SceneEncoderMLP
 from projector import DifferentiableProjector
 
@@ -40,37 +40,54 @@ from diffdrr.utils import convert as convert_rotation
 # 1. 辅助模块
 # ##############################################################################
 
-# [!!! 修改 1 !!!] 将 TripletMarginLoss 移到这里并加入 L2 归一化
-class TripletMarginLoss(nn.Module):
-    """
-    三元组损失函数。
-    [已修改] 添加了 L2 特征归一化选项。
-    """
-    def __init__(self, margin=0.1, normalize_features=False): # 添加选项
-        super(TripletMarginLoss, self).__init__()
-        self.margin = margin
-        self.mse_loss = nn.MSELoss()
-        self.normalize_features = normalize_features
-        print(f"TripletMarginLoss initialized with normalize_features={self.normalize_features}")
+# [!!! 修改 1 !!!] 移除 TripletMarginLoss 类
 
-    def forward(self, anchor, positive, negative):
-        # 可选的 L2 归一化
-        if self.normalize_features:
-            anchor = F.normalize(anchor, p=2, dim=1)
-            positive = F.normalize(positive, p=2, dim=1)
-            negative = F.normalize(negative, p=2, dim=1)
-            
-        dist_pos = self.mse_loss(anchor, positive)
-        dist_neg = self.mse_loss(anchor, negative)
-        
-        # [添加打印] 持续监控距离值
-        print(f"\n Dist_pos: {dist_pos.item():.6f}, Dist_neg: {dist_neg.item():.6f}") 
-            
-        loss = torch.relu(dist_pos - dist_neg + self.margin)
-        return loss
+# [!!! 修改 2 !!!] 定义 InfoNCE Loss 函数
+def info_nce_loss(anchor, positive, negative, temperature=0.1, eps=1e-6):
+    """
+    计算简化的 InfoNCE 损失 (针对一个正样本和一个负样本)。
+    
+    Args:
+        anchor (torch.Tensor): 锚点特征 (B, C, H, W) 或 (B, D)。
+        positive (torch.Tensor): 正样本特征 (B, C, H, W) 或 (B, D)。
+        negative (torch.Tensor): 负样本特征 (B, C, H, W) 或 (B, D)。
+        temperature (float): 温度超参数。
+        eps (float): 防止除以零的小常数。
+
+    Returns:
+        torch.Tensor: InfoNCE 损失值 (标量)。
+    """
+    # 1. L2 归一化特征 (沿通道/特征维度)
+    #    假设输入已经是 (B, D) 或需要先 flatten
+    if anchor.dim() > 2: # 如果是特征图 (B, C, H, W)
+        anchor = anchor.flatten(start_dim=1)     # (B, C*H*W)
+        positive = positive.flatten(start_dim=1) # (B, C*H*W)
+        negative = negative.flatten(start_dim=1) # (B, C*H*W)
+
+    anchor_norm = F.normalize(anchor, p=2, dim=1)
+    positive_norm = F.normalize(positive, p=2, dim=1)
+    negative_norm = F.normalize(negative, p=2, dim=1)
+
+    # 2. 计算余弦相似度
+    #    sim(a, b) = sum(a * b) / (sqrt(sum(a^2)) * sqrt(sum(b^2)))
+    #    由于已经 L2 归一化，分母为 1，直接点积即可
+    sim_pos = torch.sum(anchor_norm * positive_norm, dim=1) # (B,)
+    sim_neg = torch.sum(anchor_norm * negative_norm, dim=1) # (B,)
+
+    # 3. 计算 Softmax 分母 (exp(pos) + exp(neg))
+    logits = torch.stack([sim_pos, sim_neg], dim=1) / temperature # (B, 2)
+    
+    # 4. 计算 LogSoftmax
+    #    我们希望正样本的概率最大化，即 LogSoftmax 在第 0 个位置的值最大化
+    #    交叉熵损失等价于 -log(softmax(positive))
+    #    目标标签是 0 (代表 positive)
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=anchor.device)
+    loss = F.cross_entropy(logits, labels)
+    
+    return loss
 
 # [!!! 關鍵修改 !!!] get_random_pose_offset 現在包含旋轉
-def get_random_pose_offset(batch_size: int, device: torch.device, rot_std=10.0, trans_std=1000) -> torch.Tensor:
+def get_random_pose_offset(batch_size: int, device: torch.device, rot_std=0.1, trans_std=50.0) -> torch.Tensor:
     """
     生成一个包含随机 *旋转* 和 *平移* 的物理空间偏移矩阵 (Batch, 4, 4)。
     """
@@ -119,7 +136,7 @@ def convert_diffdrr_to_deepfluoro(dataset: LPMDataset, pose: RigidTransform):
     )
 
 def project_landmarks_for_vis(dataset: LPMDataset, pose: RigidTransform) -> np.ndarray:
-    # 保持不变 (包含unsqueeze修复)
+    # 保持不变
     device = pose.get_matrix().device
     extrinsic = convert_diffdrr_to_deepfluoro(dataset, pose.cpu()).to(device)
     intrinsic_dev = dataset.intrinsic.to(device)
@@ -183,7 +200,7 @@ def train(config):
 
     # 3. 初始化模型
     print("初始化模型: SceneEncoderHashGrid, ImageEncoder...")
-    # [!!! 修改 2 !!!] 使用 config['feature_dim'] (1536) 初始化 SceneEncoder
+    # 使用 1536 特征维度
     # scene_encoder = SceneEncoderHashGrid(
     #     bounding_box=(-1.0, 1.0), 
     #     feature_dim=config['feature_dim'] 
@@ -192,16 +209,22 @@ def train(config):
         bounding_box=(-1.0, 1.0), 
         feature_dim=config['feature_dim'] 
     ).to(device)
-    # [!!! 修改 3 !!!] ImageEncoder 不再需要 output_dim
+    # ImageEncoder 不需要 output_dim
     image_encoder = ImageEncoder(pretrained=True).to(device)
-    
+    print("\n" + "="*50)
+    print("--- 2D 图像编码器 (ImageEncoder) 架构 ---")
+    print(image_encoder)
+    print("\n" + "="*50)
+    print("--- 3D 场景编码器 (SceneEncoderHashGrid) 架构 ---")
+    print(scene_encoder)
+    print("="*50 + "\n")
     # 4. 初始化可微特征投影仪
     focal_length_norm = config['focal_length'] * normalization_scale
     near_plane_norm = config['near_plane'] * normalization_scale
     far_plane_norm = config['far_plane'] * normalization_scale
     
     print(f"初始化投影仪: 渲染尺寸={config['feature_height']}x{config['feature_width']}, 归一化焦距={focal_length_norm:.4f}")
-    # Projector 仍然渲染 8x8 特征图，通道数由 scene_encoder 决定
+    # 仍然渲染 8x8 特征图
     projector = DifferentiableProjector(
         height=config['feature_height'], 
         width=config['feature_width'],  
@@ -227,8 +250,9 @@ def train(config):
         drr_renderer = None
 
     # 6. 初始化损失函数和优化器
-    # [!!! 修改 4 !!!] 启用 L2 归一化
-    triplet_loss_fn = TripletMarginLoss(margin=config['triplet_margin'], normalize_features=True) 
+    # [!!! 修改 3 !!!] 移除 TripletLoss 初始化
+    # 我们将在循环中直接调用 info_nce_loss 函数
+    print(f"使用 InfoNCE Loss, temperature={config['temperature']}")
     
     # 使用降低后的学习率
     optimizer = optim.Adam([
@@ -265,13 +289,14 @@ def train(config):
             F_proj_pos = torch.cat([projector(scene_encoder, p) for p in pi_gt_norm], dim=0)
             F_proj_neg = torch.cat([projector(scene_encoder, p) for p in pi_wrong_norm], dim=0)
             
-            # Loss 现在会在内部进行 L2 归一化
-            loss = triplet_loss_fn(F_target, F_proj_pos, F_proj_neg)
-            print(f"loss: {loss.item():.4f}")
+            # [!!! 修改 4 !!!] 计算 InfoNCE Loss
+            loss = info_nce_loss(F_target, F_proj_pos, F_proj_neg, 
+                                 temperature=config['temperature'])
+            
             optimizer.zero_grad()
             loss.backward()
             
-            # [可选但推荐] 添加梯度裁剪
+            # [添加] 梯度裁剪 (推荐)
             torch.nn.utils.clip_grad_norm_(scene_encoder.parameters(), max_norm=1.0) 
             torch.nn.utils.clip_grad_norm_(image_encoder.parameters(), max_norm=1.0) 
             
@@ -303,7 +328,10 @@ def train(config):
                 F_proj_pos_val = torch.cat([projector(scene_encoder, p) for p in pi_gt_val_norm], dim=0)
                 F_proj_neg_val = torch.cat([projector(scene_encoder, p) for p in pi_wrong_val_norm], dim=0)
                 
-                loss = triplet_loss_fn(F_target_val, F_proj_pos_val, F_proj_neg_val)
+                # [!!! 修改 5 !!!] 计算 InfoNCE Loss
+                loss = info_nce_loss(F_target_val, F_proj_pos_val, F_proj_neg_val,
+                                     temperature=config['temperature'])
+                                     
                 val_loss_total += loss.item()
                 progress_bar_val.set_postfix(loss=f"{loss.item():.4f}")
                 
@@ -364,19 +392,19 @@ if __name__ == '__main__':
         "image_height": 256,    # 2D 输入图像的 H
         "image_width": 256,     # 2D 输入图像的 W
         
-        # [!!! 修改 5 !!!] 特征维度恢复为 1536
+        # 特征维度恢复为 1536
         "feature_dim": 1536,     # 特征通道 C (匹配 EfficientNet)
         "feature_height": 8,     # 特征图 H (匹配 EfficientNet)
         "feature_width": 8,      # 特征图 W (匹配 EfficientNet)
         
         # 训练过程相关
-        "batch_size": 8,       
+        "batch_size": 32,      
         "num_epochs": 100,     
-        # [!!! 修改 6 !!!] 降低学习率
+        # 降低学习率
         "lr_scene_encoder": 5e-4,  # 降低 Scene Encoder 学习率
-        "lr_image_encoder": 5e-5,  # 降低 Image Encoder 学习率
-        "checkpoint_dir": "./checkpoints-triplet", 
-        "log_dir": "./logs-triplet",           
+        "lr_image_encoder": 1e-4,  # 降低 Image Encoder 学习率
+        "checkpoint_dir": "./checkpoints", 
+        "log_dir": "./logs",           
 
         # 模型与渲染相关
         "n_samples_per_ray": 128,    
@@ -386,8 +414,9 @@ if __name__ == '__main__':
         "near_plane": 1.5,     
         "far_plane": 3.5,      
         
-        # 损失函数相关
-        "triplet_margin": 0.001, 
+        # [!!! 修改 6 !!!] InfoNCE Loss 相关
+        # "triplet_margin": 1.0, # 不再需要 margin
+        "temperature": 0.1,    # InfoNCE 温度参数 (常用值)
     }
 
     # 启动训练

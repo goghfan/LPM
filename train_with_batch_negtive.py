@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
 
 """
-本文件是LPM框架的核心训练脚本。
+本文件是LPM框架的核心訓練脚本。
 [已更新]
-1. feature_dim 恢复为 1536，ImageEncoder 不再映射通道。
-2. 学习率降低。
-3. TripletLoss 中加入 L2 特征归一化。
+1. 使用 SceneEncoderMLP 替代 SceneEncoderHashGrid。
+2. 使用 TripletMarginLoss (含 L2 Norm) 和指定 margin。
+3. 更新了超參數 (學習率, batch size, 負樣本偏移)。
+4. 加入了每個 batch 的損失打印。
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F # [新增] 为了 L2 归一化
+import torch.nn.functional as F # 為了 L2 歸一化
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
 import numpy as np
 
-# --- TensorBoard 和可视化导入 ---
+# --- TensorBoard 和可视化導入 ---
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import io
@@ -25,37 +26,46 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
 
-# --- 项目内部模块导入 ---
+# --- 项目内部模块導入 ---
 from data.dataloader import LPMDataset
-# [注意] 确保从包含 float() 修复的文件导入
-from models.EfficentNet import SceneEncoderHashGrid, ImageEncoder 
-from models.scene_encoder_mlp import SceneEncoderMLP
+# [!!! 修改 !!!] 導入 SceneEncoderMLP
+from models.scene_encoder_mlp import SceneEncoderMLP 
+from models.EfficentNet import ImageEncoder # 假設 ImageEncoder 仍在此處
 from projector import DifferentiableProjector
 
-# --- 外部库导入 (用于可视化) ---
+# --- 外部库導入 (用于可视化和旋转) ---
 from diffdrr.drr import DRR
 from diffpose.calibration import RigidTransform, perspective_projection 
-from diffdrr.utils import convert as convert_rotation
+from diffdrr.utils import convert as convert_rotation # 確認導入
+
 # ##############################################################################
 # 1. 辅助模块
 # ##############################################################################
 
-# [!!! 修改 1 !!!] 将 TripletMarginLoss 移到这里并加入 L2 归一化
+# TripletMarginLoss (來自您的代碼片段)
 class TripletMarginLoss(nn.Module):
     """
     三元组损失函数。
-    [已修改] 添加了 L2 特征归一化选项。
+    [已修改] 添加了 L2 特征归一化选项和内部打印。
     """
-    def __init__(self, margin=0.1, normalize_features=False): # 添加选项
+    def __init__(self, margin=0.1, normalize_features=False): # 使用您片段中的 margin=0.1
         super(TripletMarginLoss, self).__init__()
         self.margin = margin
         self.mse_loss = nn.MSELoss()
         self.normalize_features = normalize_features
-        print(f"TripletMarginLoss initialized with normalize_features={self.normalize_features}")
+        print(f"TripletMarginLoss initialized with margin={self.margin}, normalize_features={self.normalize_features}")
 
     def forward(self, anchor, positive, negative):
         # 可选的 L2 归一化
         if self.normalize_features:
+            # 確保輸入是扁平的向量 (B, D)
+            if anchor.dim() > 2:
+                anchor = anchor.flatten(start_dim=1)
+            if positive.dim() > 2:
+                positive = positive.flatten(start_dim=1)
+            if negative.dim() > 2:
+                negative = negative.flatten(start_dim=1)
+
             anchor = F.normalize(anchor, p=2, dim=1)
             positive = F.normalize(positive, p=2, dim=1)
             negative = F.normalize(negative, p=2, dim=1)
@@ -63,36 +73,33 @@ class TripletMarginLoss(nn.Module):
         dist_pos = self.mse_loss(anchor, positive)
         dist_neg = self.mse_loss(anchor, negative)
         
-        # [添加打印] 持续监控距离值
+        # [添加打印] 持续监控距离值 (來自您的代碼片段)
         print(f"\n Dist_pos: {dist_pos.item():.6f}, Dist_neg: {dist_neg.item():.6f}") 
             
         loss = torch.relu(dist_pos - dist_neg + self.margin)
         return loss
 
-# [!!! 關鍵修改 !!!] get_random_pose_offset 現在包含旋轉
-def get_random_pose_offset(batch_size: int, device: torch.device, rot_std=10.0, trans_std=1000) -> torch.Tensor:
+# get_random_pose_offset (來自您的代碼片段，包含旋轉)
+def get_random_pose_offset(batch_size: int, device: torch.device, rot_std=10.0, trans_std=1000.0) -> torch.Tensor: # 使用您片段中的默認值
     """
     生成一个包含随机 *旋转* 和 *平移* 的物理空间偏移矩阵 (Batch, 4, 4)。
     """
     offset_matrix = torch.eye(4, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
     
-    # 1. 生成随机旋转 (轴角表示)
-    #   向量方向是旋转轴，向量长度是旋转角度 (弧度)
+    # 1. 随机旋转 (轴角)
     random_rotation_vector = torch.randn(batch_size, 3, device=device) * rot_std
     
-    # 2. 将轴角向量转换为 3x3 旋转矩阵
-    #   使用 diffdrr.utils.convert (它内部调用 pytorch3d)
+    # 2. 轴角 -> 旋转矩阵
     try:
         rotation_matrix = convert_rotation(random_rotation_vector, "axis_angle", "matrix")
     except ImportError:
         print("警告: 无法从 diffdrr.utils 导入 convert。跳过旋转扰动。")
-        print("请确保 pytorch3d 已正确安装。")
-        rotation_matrix = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1) # Fallback
+        rotation_matrix = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
 
-    # 3. 应用旋转矩阵到偏移矩阵
+    # 3. 应用旋转
     offset_matrix[:, :3, :3] = rotation_matrix
     
-    # 4. 生成并应用随机平移 (保持不变)
+    # 4. 随机平移
     random_translations = torch.randn(batch_size, 3, device=device) * trans_std
     offset_matrix[:, :3, 3] = random_translations
     
@@ -119,7 +126,7 @@ def convert_diffdrr_to_deepfluoro(dataset: LPMDataset, pose: RigidTransform):
     )
 
 def project_landmarks_for_vis(dataset: LPMDataset, pose: RigidTransform) -> np.ndarray:
-    # 保持不变 (包含unsqueeze修复)
+    # 保持不变
     device = pose.get_matrix().device
     extrinsic = convert_diffdrr_to_deepfluoro(dataset, pose.cpu()).to(device)
     intrinsic_dev = dataset.intrinsic.to(device)
@@ -182,17 +189,18 @@ def train(config):
         print("✅ 成功加载地标点和投影元数据，将激活可视化。")
 
     # 3. 初始化模型
-    print("初始化模型: SceneEncoderHashGrid, ImageEncoder...")
-    # [!!! 修改 2 !!!] 使用 config['feature_dim'] (1536) 初始化 SceneEncoder
-    # scene_encoder = SceneEncoderHashGrid(
-    #     bounding_box=(-1.0, 1.0), 
-    #     feature_dim=config['feature_dim'] 
-    # ).to(device)
+    print("初始化模型: SceneEncoderMLP, ImageEncoder...") # [修改]
+    # 使用 SceneEncoderMLP
     scene_encoder = SceneEncoderMLP(
         bounding_box=(-1.0, 1.0), 
-        feature_dim=config['feature_dim'] 
+        feature_dim=config['feature_dim'],
+        # [新增] 從 config 讀取 MLP 參數 (如果未在 config 中定義，則使用默認值)
+        pos_encode_freqs=config.get('pos_encode_freqs', 10), 
+        num_layers=config.get('mlp_num_layers', 8),         
+        hidden_dim=config.get('mlp_hidden_dim', 256)          
     ).to(device)
-    # [!!! 修改 3 !!!] ImageEncoder 不再需要 output_dim
+    
+    # ImageEncoder 不需要 output_dim
     image_encoder = ImageEncoder(pretrained=True).to(device)
     
     # 4. 初始化可微特征投影仪
@@ -201,7 +209,7 @@ def train(config):
     far_plane_norm = config['far_plane'] * normalization_scale
     
     print(f"初始化投影仪: 渲染尺寸={config['feature_height']}x{config['feature_width']}, 归一化焦距={focal_length_norm:.4f}")
-    # Projector 仍然渲染 8x8 特征图，通道数由 scene_encoder 决定
+    # 渲染 8x8 特征图
     projector = DifferentiableProjector(
         height=config['feature_height'], 
         width=config['feature_width'],  
@@ -227,7 +235,7 @@ def train(config):
         drr_renderer = None
 
     # 6. 初始化损失函数和优化器
-    # [!!! 修改 4 !!!] 启用 L2 归一化
+    # 使用 TripletLoss (來自您的代碼片段)
     triplet_loss_fn = TripletMarginLoss(margin=config['triplet_margin'], normalize_features=True) 
     
     # 使用降低后的学习率
@@ -254,7 +262,13 @@ def train(config):
             I_gt, pi_gt_phys = I_gt.to(device), pi_gt_phys.to(device)
             
             with torch.no_grad():
-                offset = get_random_pose_offset(pi_gt_phys.shape[0], device)
+                # 使用 config 中的值生成偏移
+                offset = get_random_pose_offset(
+                    pi_gt_phys.shape[0], 
+                    device, 
+                    rot_std=config['rot_std_negative'], 
+                    trans_std=config['trans_std_negative'] 
+                )
                 pi_wrong_phys = torch.bmm(offset, pi_gt_phys)
                 pi_gt_norm = normalize_pose_batch(pi_gt_phys, C_phys_tensor, normalization_scale)
                 pi_wrong_norm = normalize_pose_batch(pi_wrong_phys, C_phys_tensor, normalization_scale)
@@ -265,13 +279,16 @@ def train(config):
             F_proj_pos = torch.cat([projector(scene_encoder, p) for p in pi_gt_norm], dim=0)
             F_proj_neg = torch.cat([projector(scene_encoder, p) for p in pi_wrong_norm], dim=0)
             
-            # Loss 现在会在内部进行 L2 归一化
+            # 计算 Triplet Loss (内部有 L2 Norm 和打印)
             loss = triplet_loss_fn(F_target, F_proj_pos, F_proj_neg)
-            print(f"loss: {loss.item():.4f}")
+            
+            # 打印每个 batch 的损失 (來自您的代碼片段)
+            print(f"loss: {loss.item():.4f}") 
+            
             optimizer.zero_grad()
             loss.backward()
             
-            # [可选但推荐] 添加梯度裁剪
+            # 添加梯度裁剪
             torch.nn.utils.clip_grad_norm_(scene_encoder.parameters(), max_norm=1.0) 
             torch.nn.utils.clip_grad_norm_(image_encoder.parameters(), max_norm=1.0) 
             
@@ -294,7 +311,13 @@ def train(config):
             for i, (I_gt_val, pi_gt_val_phys) in enumerate(progress_bar_val):
                 I_gt_val, pi_gt_val_phys = I_gt_val.to(device), pi_gt_val_phys.to(device)
                 
-                offset_val = get_random_pose_offset(pi_gt_val_phys.shape[0], device)
+                # 使用 config 中的值生成偏移
+                offset_val = get_random_pose_offset(
+                    pi_gt_val_phys.shape[0], 
+                    device, 
+                    rot_std=config['rot_std_negative'], 
+                    trans_std=config['trans_std_negative'] 
+                )
                 pi_wrong_val_phys = torch.bmm(offset_val, pi_gt_val_phys)
                 pi_gt_val_norm = normalize_pose_batch(pi_gt_val_phys, C_phys_tensor, normalization_scale)
                 pi_wrong_val_norm = normalize_pose_batch(pi_wrong_val_phys, C_phys_tensor, normalization_scale)
@@ -307,7 +330,7 @@ def train(config):
                 val_loss_total += loss.item()
                 progress_bar_val.set_postfix(loss=f"{loss.item():.4f}")
                 
-                # --- 可视化 (代码无改动) ---
+                # --- 可视化 ---
                 if i == 0:
                     idx_vis = np.random.randint(0, I_gt_val.shape[0])
                     pose_phys_vis = pi_gt_val_phys[idx_vis]
@@ -356,7 +379,7 @@ def train(config):
 # 3. 主程序入口
 # ##############################################################################
 if __name__ == '__main__':
-    # 配置参数
+    # 配置参数 (來自您的代碼片段)
     config = {
         # 数据相关
         "h5_dataset_path": r"F:\desktop\2D-3D\LPM\LPM\drr_pose_dataset_with_landmarks.h5", 
@@ -364,19 +387,24 @@ if __name__ == '__main__':
         "image_height": 256,    # 2D 输入图像的 H
         "image_width": 256,     # 2D 输入图像的 W
         
-        # [!!! 修改 5 !!!] 特征维度恢复为 1536
-        "feature_dim": 1536,     # 特征通道 C (匹配 EfficientNet)
-        "feature_height": 8,     # 特征图 H (匹配 EfficientNet)
-        "feature_width": 8,      # 特征图 W (匹配 EfficientNet)
+        # 特征维度
+        "feature_dim": 1536,     # 特征通道 C
+        "feature_height": 8,     # 特征图 H
+        "feature_width": 8,      # 特征图 W
+        
+        # [!!! 新增 !!!] MLP 超參數 (如果 SceneEncoderMLP 需要)
+        "pos_encode_freqs": 10,  
+        "mlp_num_layers": 8,     
+        "mlp_hidden_dim": 256,   
         
         # 训练过程相关
-        "batch_size": 8,       
+        "batch_size": 16,
         "num_epochs": 100,     
-        # [!!! 修改 6 !!!] 降低学习率
-        "lr_scene_encoder": 5e-4,  # 降低 Scene Encoder 学习率
-        "lr_image_encoder": 5e-5,  # 降低 Image Encoder 学习率
-        "checkpoint_dir": "./checkpoints-triplet", 
-        "log_dir": "./logs-triplet",           
+        # 降低学习率
+        "lr_scene_encoder": 5e-4,  
+        "lr_image_encoder": 5e-5,  
+        "checkpoint_dir": "./checkpoints-triplet-batch", # 使用您片段中的目錄
+        "log_dir": "./logs-triplet-batch",           # 使用您片段中的目錄
 
         # 模型与渲染相关
         "n_samples_per_ray": 128,    
@@ -386,8 +414,12 @@ if __name__ == '__main__':
         "near_plane": 1.5,     
         "far_plane": 3.5,      
         
-        # 损失函数相关
-        "triplet_margin": 0.001, 
+        # Triplet Loss 相关
+        "triplet_margin": 0.001, # 使用您片段中的 margin
+        
+        # [!!! 新增 !!!] 负样本偏移控制 (使用您片段中的值)
+        "rot_std_negative": 10.0,    
+        "trans_std_negative": 1000.0, 
     }
 
     # 启动训练
