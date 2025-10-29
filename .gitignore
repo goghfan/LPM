@@ -9,6 +9,7 @@ data/ljubljana/ljubljana.h5
 # 注意末尾的斜杠，表示这是一个目录
 logs/
 logs-triplet-batch/
+logs-triplet/
 tiny-cuda-nn/
 checkpoints-triplet/
 checkpoints-triplet-batch/
