@@ -1,20 +1,15 @@
 # -*- coding: utf-8 -*-
 
 """
+[!! 最终修复版 - 2025/10/30 !!]
 本文件是LPM框架的在线配准脚本。
 
-它负责执行术中在线配准阶段，其主要流程包括：
-1. 加载预训练好的 3D 场景编码器 (F_θ) 和 2D 图像编码器 (E_ϕ)。
-2. 冻结两个编码器的权重。
-3. 加载目标 X 光图像 (I_live)。
-4. 使用 E_ϕ 提取目标特征图 (F_target)。
-5. 初始化一个可优化的位姿 (π)。
-6. 启动快速迭代优化循环：
-   a. 使用可微特征投影仪 P 从 F_θ 渲染当前投影特征 (F_proj)。
-   b. 计算 F_proj 和 F_target 之间的 L2 损失。
-   c. 反向传播，仅更新位姿 π。
-7. 输出最终优化后的位姿 π*。
-8. (可选) 使用最终位姿和 F_θ 中的 ρ 生成可视化DRR。
+[修复历史]
+1. 修正了 preprocess_single_xray (移除 Log)。
+2. 修正了 F.3. 可视化位姿转换 (R.transpose)。
+3. 修正了 F.5. 可视化后处理 (移除 Log)。
+4. [!! 关键 !!] 修正了 F.1 & F.2，使用 'load' 函数加载渲染器，
+   以确保与 live_xray 完全一致的渲染参数 (解决旋转问题)。
 """
 
 import torch
@@ -25,242 +20,369 @@ import numpy as np
 import os
 import imageio # 用于加载和保存图像
 from tqdm import tqdm
-import argparse # 用于从命令行接收参数
+# import argparse # [!! 已移除 !!] 
+import torch.nn.functional as F
 
-# 从我们项目中的其他模块导入必要的组件
-from models import SceneEncoderHashGrid, ImageEncoder
+# --- 项目内部模块导入 ---
+from models.EfficentNet import SceneEncoderHashGrid, ImageEncoder
+from models.scene_encoder_mlp import SceneEncoderMLP # 作为备选项
 from projector import DifferentiableProjector
-from utils import get_rays # 确保utils.py在可导入的路径下
-# 假设有一个预处理函数可以加载和处理单张X光图像
-# from dataloader import preprocess_single_xray # 需要您根据实际情况实现或调整
-# 假设有一个函数可以将6D向量转换为4x4矩阵 (如果使用6D表示位姿)
-# from pose_utils import vec_to_matrix, matrix_to_vec # 需要您根据实际情况实现
+from utils import get_rays
+from data.dataloader import LPMDataset # 用于加载归一化参数和CT体积
+from diffpose.deepfluoro import DeepFluoroDataset # [!! 已使用 !!] 用于加载 x0, y0, focal_len
+from diffpose.calibration import RigidTransform # 用于DRR可视化
+from diffdrr.drr import DRR # 用于DRR可视化
+from diffdrr.utils import se3_log_map, se3_exp_map # 关键：用于位姿参数化
 
-# 临时的图像预处理函数 (需要根据您训练时使用的预处理进行调整)
-def preprocess_single_xray(image_path: str, target_height: int, target_width: int, device: torch.device) -> torch.Tensor:
-    """
-    加载单张X光图像并进行预处理。
-    这是一个示例实现，您需要确保它与训练 E_ϕ 时使用的预处理一致。
-    """
-    img = imageio.imread(image_path).astype(np.float32)
-    img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0) # [H, W] -> [1, 1, H, W]
-    
-    # 示例预处理：调整尺寸，归一化到[0,1] (这可能不足够，需要匹配训练时的预处理)
-    # 注意：这里的预处理应尽可能复现训练数据加载器中的逻辑
-    # 比如是否需要对数变换 log(I0) - log(I)？
-    img_tensor = nn.functional.interpolate(img_tensor, size=(target_height, target_width), mode='bilinear', align_corners=False)
-    min_val = torch.min(img_tensor)
-    max_val = torch.max(img_tensor)
-    if max_val > min_val:
-        img_tensor = (img_tensor - min_val) / (max_val - min_val)
-        
-    return img_tensor.to(device)
-
-# --- 定义6D位姿参数化 (一个简单的实现) ---
-# 在实际应用中，使用李代数 (se(3)) 或四元数+平移通常更稳定
-class PoseParameterization(nn.Module):
-    """
-    将一个6D向量参数化为一个4x4 SE(3)矩阵。
-    这是一个简化的实现，使用欧拉角 ZYX。
-    """
-    def __init__(self, initial_pose_matrix: torch.Tensor):
-        super().__init__()
-        # 从初始矩阵估计旋转和平移 (简化逻辑)
-        initial_rotation = initial_pose_matrix[:3, :3]
-        initial_translation = initial_pose_matrix[:3, 3]
-        # TODO: 将旋转矩阵转换为欧拉角或其他6D表示，这里用randn简化
-        self.pose_vec = nn.Parameter(torch.randn(6, device=initial_pose_matrix.device)) 
-        
-    def forward(self) -> torch.Tensor:
-        """从6D向量构造4x4矩阵"""
-        # TODO: 实现从6D向量 (例如: rx, ry, rz, tx, ty, tz) 到4x4矩阵的精确转换
-        # 这里返回一个简化的单位矩阵+参数平移，仅用于结构演示
-        mat = torch.eye(4, device=self.pose_vec.device)
-        mat[:3, 3] = self.pose_vec[3:] # 假设后三个是平移
-        # 旋转部分需要更复杂的实现 (例如 Rodrigues' formula)
-        return mat
+# [!! 新增导入 !!] 从 test_drr.py 借鉴，用于加载一致的渲染器
+try:
+    from get_deepfluoro_4000 import load
+except ImportError:
+    print("="*50)
+    print("!! 错误: 无法从 'get_deepfluoro_4000.py' 导入 'load' 函数。")
+    print("!! 请确保此脚本与 'get_deepfluoro_4000.py' 在同一个文件夹中。")
+    print("="*50)
+    exit()
 
 # ##############################################################################
-# 1. 主配准函数
+# 1. 辅助模块 (预处理, 位姿参数化, 归一化)
+# ##############################################################################
+
+def preprocess_single_xray(image_path: str, target_height: int, target_width: int, device: torch.device) -> torch.Tensor:
+    """
+    [!! 已修复 !!]
+    加载单张X光图像并进行预处理。
+    我们只需要： 1. 加载 2. 调整大小 3. 归一化 [0, 255] -> [0, 1]
+    """
+    try:
+        with imageio.v2.imopen(image_path, 'r') as f:
+            img = f.read(index=0).astype(np.float32) # img 范围是 [0, 255]
+    except Exception as e:
+        print(f"使用 imageio 加载失败: {e}。")
+        return None
+
+    # 处理灰度图 (H, W) -> (1, 1, H, W)
+    if img.ndim == 2:
+        img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+    # 处理RGB图 (H, W, 3) -> (1, 1, H, W)
+    elif img.ndim == 3:
+        img_tensor = torch.from_numpy(img).mean(dim=2).unsqueeze(0).unsqueeze(0)
+    else:
+        print(f"不支持的图像维度: {img.shape}")
+        return None
+
+    img_tensor = img_tensor.to(device)
+
+    # 1. 调整尺寸
+    img_tensor = F.interpolate(img_tensor, size=(target_height, target_width), mode='bilinear', align_corners=False)
+
+    # 2. [!! 已移除 !!] Log 变换
+
+    # 3. [!! 已修改 !!] Min-Max 归一化到 [0, 1]
+    img_tensor = img_tensor / 255.0
+    img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
+    
+    return img_tensor
+
+class OptimizablePoseSE3(nn.Module):
+    # ... [此类保持不变] ...
+    def __init__(self, initial_pose_matrix: torch.Tensor):
+        super().__init__()
+        if initial_pose_matrix.shape != (4, 4):
+            raise ValueError(f"初始位姿必须是 (4, 4) 矩阵, 但收到 {initial_pose_matrix.shape}")
+        
+        temp_matrix_for_logmap = initial_pose_matrix.clone()
+        temp_matrix_for_logmap[:3, 3] = 0.0 
+        temp_matrix_for_logmap[:3, :3] = initial_pose_matrix[:3, :3] 
+        temp_matrix_for_logmap[3, :3] = initial_pose_matrix[3, :3] 
+        temp_matrix_for_logmap[3, 3] = 1.0
+        
+        initial_se3_log = se3_log_map(temp_matrix_for_logmap.unsqueeze(0)) 
+        self.se3_log = nn.Parameter(initial_se3_log.squeeze(0))
+        
+    def forward(self) -> torch.Tensor:
+        matrix_row_vec = se3_exp_map(self.se3_log.unsqueeze(0))
+        return matrix_row_vec.squeeze(0)
+
+def normalize_pose_batch(pi_phys_batch: torch.Tensor, C_phys_tensor: torch.Tensor, s: float) -> torch.Tensor:
+    # ... [此函数保持不变] ...
+    R_batch = pi_phys_batch[:, :3, :3] 
+    t_phys_batch = pi_phys_batch[:, 3, :3] 
+    t_norm_batch = (t_phys_batch - C_phys_tensor.unsqueeze(0)) * s
+    pi_norm_batch = torch.eye(4, device=pi_phys_batch.device, dtype=pi_phys_batch.dtype).unsqueeze(0).repeat(pi_phys_batch.shape[0], 1, 1)
+    pi_norm_batch[:, :3, :3] = R_batch
+    pi_norm_batch[:, 3, :3] = t_norm_batch 
+    return pi_norm_batch
+
+# ##############################################################################
+# 2. 主配准函数
 # ##############################################################################
 
 def register(config):
     """
-    执行在线配准流程的主函数。
+    [!! 最终修复版 !!]
+    使用正确的预处理和可视化参数执行完整优化。
     """
-    # --- A. 初始化与模型加载 ---
+    # --- A. 初始化与加载模型 ---
     print("--- 1. 初始化与加载模型 ---")
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 加载预训练的3D场景编码器
-    scene_encoder = SceneEncoderHashGrid(feature_dim=config['feature_dim']).to(device)
-    scene_encoder.load_state_dict(torch.load(config['scene_encoder_path'], map_location=device))
-    scene_encoder.eval() # 设置为评估模式
-    scene_encoder.requires_grad_(False) # 冻结权重
-    print(f"3D场景编码器加载自: {config['scene_encoder_path']}")
+    # --- 加载归一化参数和可视化所需数据 ---
+    print("正在从数据集中加载归一化参数...")
+    try:
+        # [!! 注意 !!] 'load' 函数会自己加载 volume, 
+        # 但我们仍然需要 LPMDataset 来获取 C_phys 和 s
+        temp_dataset = LPMDataset(config['h5_dataset_path'], config['specimen_id'], split='val')
+        C_phys_tensor = torch.from_numpy(temp_dataset.C_phys_xyz).float().to(device)
+        normalization_scale = temp_dataset.s
+        temp_dataset.close() # C 和 s 已拿到，关闭文件
 
-    # 加载预训练的2D图像编码器
-    image_encoder = ImageEncoder(pretrained=False).to(device) # pretrained=False 因为我们要加载自己的权重
-    image_encoder.load_state_dict(torch.load(config['image_encoder_path'], map_location=device))
-    image_encoder.eval() # 设置为评估模式
-    image_encoder.requires_grad_(False) # 冻结权重
-    print(f"2D图像编码器加载自: {config['image_encoder_path']}")
+        # [!! 已修改 !!] 始终从 DeepFluoroDataset 加载 x0, y0, 和 真实的focal_len
+        print(f"...正在从原始数据集 '{config['original_h5_path']}' 加载 x0, y0, 和 focal_len...")
+        specimen_loader = DeepFluoroDataset(config['specimen_id'], filename=config['original_h5_path'])
+        x0 = specimen_loader.x0
+        y0 = specimen_loader.y0
+        true_focal_length = specimen_loader.focal_len 
+        print(f"    > 成功加载: x0={x0}, y0={y0}, true_focal_length={true_focal_length}")
+            
+        print(f"  > 成功加载 (来自 {config['h5_dataset_path']}): s={normalization_scale:.6f}, C_phys={C_phys_tensor.cpu().numpy()}")
 
-    # 初始化可微特征投影仪 (参数需与训练时一致)
+    except Exception as e:
+        print(f"!!! 错误: 无法从HDF5文件加载数据。")
+        print(f"  请确保 h5_dataset_path 和 original_h5_path 正确。错误: {e}")
+        return
+
+    # --- 加载预训练的3D场景编码器 ---
+    print("加载3D场景编码器 (F_θ)...")
+    scene_encoder = SceneEncoderMLP(feature_dim=config['feature_dim']).to(device)
+    try:
+        scene_encoder.load_state_dict(torch.load(config['scene_encoder_path'], map_location=device))
+        scene_encoder.eval()
+        scene_encoder.requires_grad_(False)
+        print(f"  > 3D场景编码器加载自: {config['scene_encoder_path']}")
+    except Exception as e:
+        print(f"!!! 错误: 加载场景编码器失败: {e}")
+        return
+
+    # --- 加载预训练的2D图像编码器 ---
+    print("加载2D图像编码器 (E_ϕ)...")
+    try:
+        image_encoder = ImageEncoder(pretrained=False).to(device)
+        image_encoder.load_state_dict(torch.load(config['image_encoder_path'], map_location=device))
+        image_encoder.eval()
+        image_encoder.requires_grad_(False)
+        print(f"  > 2D图像编码器加载自: {config['image_encoder_path']}")
+    except Exception as e:
+        print(f"!!! 错误: 加载图像编码器失败: {e}")
+        return
+
+    # --- 初始化可微特征投影仪 ---
+    # [注] 这是用于特征优化的，与F节的可视化渲染器无关
+    print("初始化可微投影仪 (P)...")
+    
+    focal_length_norm = true_focal_length * normalization_scale
+    near_plane_norm = config['near_plane'] * normalization_scale
+    far_plane_norm = config['far_plane'] * normalization_scale
+    print(f"  > [!] 投影仪使用 *真实* 焦距: {true_focal_length:.2f} (归一化后: {focal_length_norm:.4f})")
+    print(f"  > [!] 投影仪使用 *物理* 近/远平面: {config['near_plane']:.2f} / {config['far_plane']:.2f}")
+
     projector = DifferentiableProjector(
-        height=config['image_height'], width=config['image_width'], n_samples=config['n_samples_per_ray'],
-        focal_length=config['focal_length'], near=config['near_plane'], far=config['far_plane'],
+        height=config['feature_height'], 
+        width=config['feature_width'],
+        n_samples=config['n_samples_per_ray'],
+        focal_length = focal_length_norm,
+        near = near_plane_norm,
+        far = far_plane_norm,
     ).to(device)
     
     # --- B. 加载目标图像并提取特征 ---
-    print("\n--- 2. 加载目标X光并提取特征 ---")
-    
-    # 加载并预处理实时X光图像
+    print("\n--- 2. 加载目标X光并提取特征 (使用修正后的预处理) ---")
+
     I_live = preprocess_single_xray(
-        config['live_xray_path'], 
+        config['live_xray_path'],
         config['image_height'], 
-        config['image_width'], 
+        config['image_width'],
         device
     )
-    print(f"实时X光图像加载自: {config['live_xray_path']}")
+    if I_live is None:
+        print(f"!!! 错误: 无法加载或处理实时X光图像: {config['live_xray_path']}")
+        return
 
-    # 提取目标特征图
+    print(f"  > 实时X光图像加载自: {config['live_xray_path']}")
+
     with torch.no_grad():
-        F_target = image_encoder(I_live)
-    print(f"目标特征图已提取，形状: {F_target.shape}")
+        F_target = image_encoder(I_live) # [1, C, H_feat, W_feat]
+    print(f"  > 目标特征图已提取，形状: {F_target.shape}")
+
 
     # --- C. 初始化位姿与优化器 ---
     print("\n--- 3. 初始化位姿与优化器 ---")
 
-    # 加载或设置初始位姿猜测 (4x4矩阵)
-    # 这里我们假设一个初始位姿矩阵存储在numpy文件中，或者直接创建一个
-    if config['initial_pose_path'] and os.path.exists(config['initial_pose_path']):
-        initial_pose_np = np.load(config['initial_pose_path'])
-        initial_pose = torch.from_numpy(initial_pose_np).float().to(device)
-        print(f"从文件加载初始位姿: {config['initial_pose_path']}")
-    else:
-        # 如果没有提供初始位姿，创建一个默认位姿 (例如单位矩阵 + Z轴偏移)
-        initial_pose = torch.eye(4, device=device)
-        initial_pose[2, 3] = 2.5 # 示例偏移，应根据场景调整
-        print("未提供初始位姿文件，使用默认位姿。")
-        
-    # 将4x4矩阵参数化为可优化的形式 (例如6D向量)
-    # 注意：这里的PoseParameterization是一个简化示例
-    pose_param = PoseParameterization(initial_pose).to(device)
+    # [注] 这是 Ground Truth 位姿，优化器应该几乎不动
+    initial_pose_np = np.array([
+        [-4.2012874e-02,  9.3289483e-01, -3.5769010e-01,  0.0000000e+00], 
+        [ 2.6626430e-02, -3.5683364e-01, -9.3378842e-01,  0.0000000e+00], 
+        [-9.9876219e-01, -4.8755147e-02, -9.8480554e-03,  0.0000000e+00], 
+        [ 2.4465094e+02,  3.1753845e+02,  6.4038788e+01,  1.0000000e+00]  
+    ], dtype=np.float32)
     
-    # 定义仅优化位姿参数的优化器
+    initial_pose = torch.from_numpy(initial_pose_np).float().to(device)
+    print(f"  > [!] 使用初始位姿 (行向量约定):")
+    print(initial_pose_np)
+    
+    pose_param = OptimizablePoseSE3(initial_pose).to(device)
+
     optimizer = optim.Adam(pose_param.parameters(), lr=config['lr_pose'])
-    
-    # 定义配准损失 (L2距离)
     registration_loss_fn = nn.MSELoss()
+    print(f"  > 优化器: Adam, 学习率: {config['lr_pose']}")
 
     # --- D. 迭代优化位姿 ---
     print("\n--- 4. 开始迭代优化位姿 ---")
-    
-    # 使用tqdm显示优化进度
+
     progress_bar = tqdm(range(config['num_iterations']), desc="配准优化")
     for iter_num in progress_bar:
-        # 1. 从可优化参数构造当前的4x4位姿矩阵
-        current_pose_matrix = pose_param() 
-        
-        # 2. 使用当前位姿，通过投影仪渲染投影特征
-        #    注意 projector 可能不支持批处理，确保输入是 [4, 4]
-        F_proj_current = projector(scene_encoder, current_pose_matrix.squeeze(0)) # 假设 projector 处理单个 pose
-        
-        # 3. 计算隐空间中的L2损失
-        loss = registration_loss_fn(F_proj_current, F_target)
-        
-        # 4. 反向传播，仅计算位姿参数的梯度
         optimizer.zero_grad()
+        current_pose_phys = pose_param() 
+        current_pose_norm = normalize_pose_batch(
+            current_pose_phys.unsqueeze(0), 
+            C_phys_tensor,
+            normalization_scale
+        )
+        F_proj_current = projector(scene_encoder, current_pose_norm.squeeze(0)) 
+        loss = registration_loss_fn(F_proj_current, F_target)
         loss.backward()
-        
-        # 5. 更新位姿参数
         optimizer.step()
-        
-        # 在进度条上显示当前损失
         progress_bar.set_postfix(loss=f"{loss.item():.6f}")
+    
+    print(f"优化完成。最终损失: {loss.item():.8f}")
+
 
     # --- E. 获取最终位姿 ---
     print("\n--- 5. 优化完成 ---")
-    
-    # 从优化后的参数构造最终的4x4位姿矩阵
-    final_pose_matrix = pose_param().detach() # detach()确保不再追踪梯度
-    print("最终优化后的位姿矩阵:")
+    final_pose_matrix = pose_param().detach() # (4, 4) 行向量约定矩阵
+    print("最终优化后的物理位姿矩阵 (行向量约定):")
     print(final_pose_matrix.cpu().numpy())
-    
-    # 保存最终位姿
+
     if config['output_pose_path']:
         np.save(config['output_pose_path'], final_pose_matrix.cpu().numpy())
-        print(f"最终位姿已保存至: {config['output_pose_path']}")
+        print(f"  > 最终位姿已保存至: {config['output_pose_path']}")
 
     # --- F. (可选) 生成可视化DRR ---
     if config['generate_visualization']:
-        print("\n--- 6. 生成最终可视化DRR ---")
+        print("\n--- 6. 生成最终可视化DRR (使用一致的参数和后处理) ---")
         try:
-            # 需要一个物理DRR渲染器实例 (这里假设它在config中定义或可以构建)
-            # from diffdrr.drr import DRR # 确保导入
-            # physical_drr_renderer = DRR(...) # 需要正确的参数初始化
+            # 1. & 2. [!! 已修正 - 解决旋转问题 !!] 
+            #    不再手动初始化 DRR。
+            #    使用与 test_drr.py 相同的 'load' 函数来获取预配置的渲染器。
+            #    这能保证渲染参数 (sdr, delx, x0, y0, ...) 绝对一致。
             
-            # --- 注意：这部分需要您根据物理渲染器的具体API进行调整 ---
-            # 假设物理渲染器接受RigidTransform对象
-            # from diffpose.calibration import RigidTransform # 确保导入
-            # final_pose_rt = RigidTransform(rotation=final_pose_matrix[:3, :3], translation=final_pose_matrix[:3, 3])
+            print("    > 正在使用 'load' 函数加载预配置的DRR渲染器 (同 test_drr.py)...")
             
-            # with torch.no_grad():
-            #     I_final_drr = physical_drr_renderer(pose=final_pose_rt) # 调用渲染
-                
-            # 保存或显示最终DRR
-            # final_drr_np = I_final_drr.squeeze().cpu().numpy()
-            # final_drr_np = (np.clip(final_drr_np, 0, 1) * 255).astype(np.uint8)
-            # imageio.imwrite(config['output_drr_path'], final_drr_np)
-            # print(f"最终可视化DRR已保存至: {config['output_drr_path']}")
-            print("可视化DRR生成部分已注释掉，请根据您的物理渲染器API取消注释并调整。")
+            # 'load' 函数会返回它自己的 CT 体积 (specimen) 和渲染器
+            # 我们使用它返回的 drr_renderer
+            specimen_vis, isocenter_pose_vis, drr_renderer = load(
+                id_number=config['specimen_id'],
+                height=config['image_height'], # 确保高度匹配
+                device=device,
+                h5_datapath=config['original_h5_path'] # 使用原始数据路径
+            )
+            
+            # 确保渲染器在正确的设备上 (load 可能在 cpu 上创建)
+            drr_renderer = drr_renderer.to(device)
+            
+            # print(f"    > 成功加载渲染器: H={drr_renderer.height}, W={drr_renderer.width}, delx={drr_renderer.delx:.6f}, sdr={drr_renderer.sdr:.2f}")
+
+            # 3. 准备位姿 [!! 关键修正 - 基于 test_drr.py !!]
+            print("    > [!!] 修正位姿转换: R = R_matrix[:3, :3].transpose(-1, -2), t = t_matrix[3, :3]")
+            final_R_for_vis = final_pose_matrix[:3, :3].transpose(-1, -2) # R_col = R_row.T
+            final_t_for_vis = final_pose_matrix[3, :3]                # t_row
+            final_pose_rt = RigidTransform(R=final_R_for_vis, t=final_t_for_vis)
+
+
+            # 4. 渲染DRR (生成 原始 衰减图)
+            with torch.no_grad():
+                I_final_drr_raw_tensor = drr_renderer(None, None, None, pose=final_pose_rt) 
+
+            # 5. [!! 关键 - 已修正 !!] 
+            #    应用与目标图像 (live_xray) 相同的后处理 (仅 Min-Max 归一化)
+            print("    > 正在应用 Min-Max 归一化 (以匹配目标图像)...")
+            
+            # --- [!! 已移除 !!] Log 变换 ---
+
+            # --- Min-Max 归一化到 [0, 1] (直接在 raw tensor 上操作) ---
+            I_final_drr_tensor = I_final_drr_raw_tensor.clone() # [!!] 使用 raw tensor
+            
+            min_val = torch.min(I_final_drr_tensor)
+            max_val = torch.max(I_final_drr_tensor)
+            if (max_val - min_val) > 1e-6:
+                I_final_drr_tensor = (I_final_drr_tensor - min_val) / (max_val - min_val)
+            else:
+                I_final_drr_tensor = torch.zeros_like(I_final_drr_tensor)
+            
+            # 6. 保存图像 (归一化到 0-255)
+            final_drr_np = I_final_drr_tensor.squeeze().cpu().numpy()
+            
+            if np.isnan(final_drr_np).any():
+                print("!!! 警告: 最终DRR包含NaN，将替换为0。")
+                final_drr_np = np.nan_to_num(final_drr_np, nan=0.0)
+
+            final_drr_np = (final_drr_np * 255).astype(np.uint8)
+            
+            imageio.imwrite(config['output_drr_path'], final_drr_np)
+            print(f"  > 最终可视化DRR已保存至: {config['output_drr_path']}")
+            print(f"  > [!] 此DRR现在在几何形状和视觉外观上都应匹配目标图像。")
 
         except Exception as e:
-            print(f"生成可视化DRR时出错: {e}")
-            print("请确保物理渲染器已正确配置并可以访问必要的CT数据。")
-            
+            print(f"!!! 警告: 生成可视化DRR时出错: {e}")
+            import traceback
+            traceback.print_exc() # 打印详细错误
+
     return final_pose_matrix
 
 # ##############################################################################
-# 4. 主程序入口与参数解析
+# 3. 主程序入口与参数解析
 # ##############################################################################
 if __name__ == '__main__':
-    # 使用 argparse 来从命令行接收参数，使脚本更灵活
-    parser = argparse.ArgumentParser(description="LPM 在线配准脚本")
     
-    # --- 必须提供的路径 ---
-    parser.add_argument('--scene_encoder_path', type=str, required=True, help='预训练的3D场景编码器模型 (.pth) 路径')
-    parser.add_argument('--image_encoder_path', type=str, required=True, help='预训练的2D图像编码器模型 (.pth) 路径')
-    parser.add_argument('--live_xray_path', type=str, required=True, help='需要配准的实时X光图像文件路径')
-    
-    # --- 可选的输入/输出路径 ---
-    parser.add_argument('--initial_pose_path', type=str, default=None, help='初始位姿猜测的numpy文件 (.npy) 路径 (4x4矩阵)')
-    parser.add_argument('--output_pose_path', type=str, default='./final_pose.npy', help='保存最终优化位姿的路径 (.npy)')
-    
-    # --- 模型与渲染参数 (应与训练时匹配) ---
-    parser.add_argument('--feature_dim', type=int, default=32, help='场景编码器输出的特征维度')
-    parser.add_argument('--image_height', type=int, default=256, help='投影仪和图像处理的目标高度')
-    parser.add_argument('--image_width', type=int, default=256, help='投影仪和图像处理的目标宽度')
-    parser.add_argument('--n_samples_per_ray', type=int, default=128, help='每条射线上的采样点数')
-    parser.add_argument('--focal_length', type=float, default=300.0, help='虚拟相机的焦距')
-    parser.add_argument('--near_plane', type=float, default=1.5, help='渲染近裁剪平面')
-    parser.add_argument('--far_plane', type=float, default=3.5, help='渲染远裁剪平面')
-    
-    # --- 优化参数 ---
-    parser.add_argument('--num_iterations', type=int, default=200, help='位姿优化迭代次数')
-    parser.add_argument('--lr_pose', type=float, default=1e-3, help='位姿优化学习率')
-    
-    # --- 可视化选项 ---
-    parser.add_argument('--generate_visualization', action='store_true', help='是否生成最终的可视化DRR图像')
-    parser.add_argument('--output_drr_path', type=str, default='./final_drr.png', help='保存最终可视化DRR的路径 (.png)')
-    
-    args = parser.parse_args()
-    
-    # 将解析后的参数转换为配置字典
-    config = vars(args)
-    
+    print("===================================================")
+    print("== [!! 最终修复版 (2025/10/30) !!] 正在运行 ==")
+    print("===================================================")
+
+    config = {
+        # --- 必需的路径 ---
+        'scene_encoder_path': "./checkpoints/checkpoints-1030/best_scene_encoder.pth",
+        'image_encoder_path': "./checkpoints/checkpoints-1030/best_image_encoder.pth",
+        'live_xray_path': "live_xray_for_registration.png", # <--- 必须由 generation_drr.py 生成
+        'h5_dataset_path': "F:/desktop/2D-3D/LPM/LPM/drr_pose_dataset_with_landmarks.h5",
+        'original_h5_path': "F:\\desktop\\2D-3D\\LPM\\LPM\\data\\ipcai_2020_full_res_data\\ipcai_2020_full_res_data.h5",
+        
+        # --- 必需的ID ---
+        'specimen_id': 1,
+        
+        # --- 可选的输入/输出路径 ---
+        'initial_pose_path': None, # 已被硬编码的 initial_pose_np 替代
+        'output_pose_path': "./final_registered_pose.npy",
+        
+        # --- 模型与渲染参数 ---
+        'feature_dim': 1536,
+        'image_height': 256,
+        'image_width': 256,
+        'feature_height': 8,
+        'feature_width': 8,
+        'n_samples_per_ray': 128,
+        'near_plane': 10.0,
+        'far_plane': 400.0,
+        
+        # --- 优化参数 ---
+        'num_iterations': 200, # 您可以增加这个值以获得更精确的结果
+        'lr_pose': 1e-3,       
+        
+        # --- 可视化选项 ---
+        'generate_visualization': True,
+        'output_drr_path': "./final_registered_drr.png"
+    }
+
     # 启动配准流程
     final_pose = register(config)

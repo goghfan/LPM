@@ -137,7 +137,7 @@ if __name__ == "__main__":
     IMAGE_HEIGHT = 256
     
     ORIGINAL_DATA_PATH = r"F:\desktop\2D-3D\LPM\LPM\data\ipcai_2020_full_res_data\ipcai_2020_full_res_data.h5"
-    OUTPUT_H5_FILE = r"F:\desktop\2D-3D\LPM\LPM\data\ipcai_2020_full_res_data\drr_pose_dataset_with_landmarks.h5"
+    OUTPUT_H5_FILE = r"F:\desktop\2D-3D\LPM\LPM\data\ipcai_2020_full_res_data\drr_pose_dataset_with_landmarks123123.h5"
     
     create_drr_dataset_with_source(
         ct_ids=CT_IDS_TO_PROCESS,

@@ -370,24 +370,24 @@ if __name__ == '__main__':
         "feature_width": 8,      # 特征图 W (匹配 EfficientNet)
         
         # 训练过程相关
-        "batch_size": 8,       
+        "batch_size": 16,       
         "num_epochs": 100,     
         # [!!! 修改 6 !!!] 降低学习率
         "lr_scene_encoder": 5e-4,  # 降低 Scene Encoder 学习率
         "lr_image_encoder": 5e-5,  # 降低 Image Encoder 学习率
-        "checkpoint_dir": "./checkpoints-triplet", 
-        "log_dir": "./logs-triplet",           
+        "checkpoint_dir": "./checkpoints-1030", 
+        "log_dir": "./logs-1030",           
 
         # 模型与渲染相关
         "n_samples_per_ray": 128,    
         
         # 物理单位 (mm)
-        "focal_length": 300.0, 
-        "near_plane": 1.5,     
-        "far_plane": 3.5,      
+        "focal_length": 1050.0, 
+        "near_plane": 1,     
+        "far_plane": 4000,      
         
         # 损失函数相关
-        "triplet_margin": 0.001, 
+        "triplet_margin": 0.01, 
     }
 
     # 启动训练

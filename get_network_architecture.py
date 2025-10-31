@@ -22,7 +22,7 @@ import io
 from PIL import Image
 import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
-
+from models.scene_encoder_mlp import SceneEncoderMLP
 # --- 项目内部模块导入 ---
 from data.dataloader import LPMDataset
 # from models.model import SceneEncoderHashGrid
@@ -155,14 +155,17 @@ def train(config):
 
     # 3. 初始化模型
     print("初始化模型: SceneEncoderHashGrid, ImageEncoder...")
-    scene_encoder = SceneEncoderHashGrid(
+    # scene_encoder = SceneEncoderHashGrid(
+    #     bounding_box=(-1.0, 1.0), 
+    #     feature_dim=config['feature_dim']
+    # ).to(device)
+    scene_encoder = SceneEncoderMLP(
         bounding_box=(-1.0, 1.0), 
-        feature_dim=config['feature_dim']
+        feature_dim=config['feature_dim'] 
     ).to(device)
     # [修正 Loss 错误] 传递 output_dim
     image_encoder = ImageEncoder(
-        pretrained=True, 
-        output_dim=config['feature_dim']
+        pretrained=True
     ).to(device)
     
     # --- [!!! 新增代码：打印模型架构 !!!] ---
